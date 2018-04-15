@@ -6,7 +6,7 @@
 #
 # Usage: [<options>...] <file.iso>
 #
-# Create a bootable FAT32 USB device from a linux-GNU/unix ISO.
+# Create a bootable USB device from any ISO.
 #
 # Options
 #  -h, --help, help             Display this help message.
@@ -39,7 +39,7 @@
 # 5. If not given the --no-usb-check option, assert that the given device is connected through USB via `udevadm' utility. If the assertion fails, exit with error status.
 # 6. If not given the -y, --assume-yes option, prompt the user for confirmation that data might be lost for selected device if he goes to next step.
 # 7. Unmount the USB if mounted, blank it and delete existing partitions.
-# 8. Create a FAT32 partition on the USB device.
+# 8. Create a partition on the USB device.
 # 9. Create a temporary dir to mount the ISO file and mount it.
 # 10. Create a temporary dir to mount the USB device and mount it.
 # 11. Copy files from ISO to USB device.
@@ -57,12 +57,13 @@ fi
 
 typeset -a commandDependencies=('lsblk' 'sfdisk' 'mkfs' 'blkid' 'wipefs' 'grep' 'file' 'awk' 'mlabel')
 typeset -A commandPackages=([lsblk]='util-linux' [sfdisk]='util-linux' [mkfs]='util-linux' [blkid]='util-linux' [wipefs]='util-linux' [grep]='grep' [file]='file' [awk]='gawk' [mlabel]='mtools' [syslinux]='syslinux' [rsync]='rsync')
-typeset shortOptions='bydJahlsM'
-
+typeset shortOptions='bydJahlsMftL'
+typeset -a supportedFS=('vfat' 'exfat' 'ntfs' 'ext3' 'ext4')
+typeset -A fdiskTypeCodes=([vfat]='c' [exfat]='7' [ntfs]='7' [ext3]='83' [ext4]='83')
 typeset selectedDevice
 typeset selectedPartition
 typeset selectedIsoFile
-typeset isoLabel
+typeset partitionLabel
 typeset isoMountPoint
 typeset usbMountPoint
 typeset startTime
@@ -72,12 +73,13 @@ typeset operationSuccess=false
 
 # options
 
+typeset partitionType='vfat'
 typeset addSyslinuxBootloader=false
 typeset disableMimeCheck=false
 typeset disableUSBCheck=false
 typeset disableConfirmation=false
-typeset useDD=false
-typeset shouldMakeFAT32Partition=true
+typeset mode='rsync'
+typeset shouldMakePartition=true
 typeset ejectDevice=true
 typeset autoselect=false
 typeset isEndOfOptions=false
@@ -92,10 +94,14 @@ Options
 
 -h, --help, help             Display this help message and exit.
 -v, --version                Display version and exit.
+-l, --list-usb-drives        List available USB drives and exit.
+-f, --format                 Format selected USB drive and exit.
 -d, --device  <device>       Select <device> block file as USB device.
                              If <device> is not connected through USB, \`$scriptName' will fail and exit.
                              Device block files are usually situated in /dev/sXX or /dev/hXX.
                              You will be prompted to select a device if you don't use this option.
+-t, --type <type>            Format to \`<type>' instead of standard FAT32 (vfat). Allowed values: vfat, ntfs, exfat, ext3, ext4
+-L, --label <label>          Use \`<label>' instead of ISO name. Also work with \`-f' option.
 -b, --bootloader             Install a bootloader with syslinux (safe mode) for non-hybrid ISOs. Does not work with \`--dd' option.
 -y, --assume-yes             \`$scriptName' won't prompt the user for confirmation before erasing and partitioning USB device.
                              \\033[1;33mUse at your own risks.\\033[0m
@@ -103,7 +109,6 @@ Options
                              Autoselect will automatically select a USB drive device if there is exactly one connected to the system.
                              Enabled by default when neither -d nor --no-usb-check options are given.
 -J, --no-eject               Do not eject device after unmounting.
--l, --list-usb-drives        List available USB drives.
 -M, --no-mime-check          \`$scriptName' won't assert that selected ISO file has the right mime-type.
 -s, --strict-mime-check      Disallow loose application/octet-stream mime type in ISO file.
 --                           POSIX end of options.
@@ -112,7 +117,7 @@ Options
 --no-usb-check               \`$scriptName' won't assert that selected device is a USB (connected through USB bus).
                              \\033[0;31mUse at your own risks.\\033[0m
 
-Readme
+Info
 
     Bootiso v$version.
     Author: Jules Samuel Randolph
@@ -144,7 +149,7 @@ failAndExit() {
 }
 
 hasPackage() {
-  which "$1" &> /dev/null
+  command -v "$1" &> /dev/null
   return $?
 }
 
@@ -196,9 +201,21 @@ failISOCheck() {
   exit 1
 }
 
-assertISOMimeType() {
-  typeset mimetype=$(file --mime-type  -b -- "$selectedIsoFile")
+assertISOIsOK() {
+  typeset mimetype
   typeset -i isOctetStream
+  if [ -z "$selectedIsoFile" ]; then
+    echoerr "Missing argument \`iso-file'."
+    display_help
+    exit 2
+  fi
+  if [ -d "$selectedIsoFile" ]; then
+    failAndExit "Provided file \`$selectedIsoFile' is a directory."
+  fi
+  if [ ! -f "$selectedIsoFile" ]; then
+    failAndExit "Provided iso file \`$selectedIsoFile' does not exists."
+  fi
+  mimetype=$(file --mime-type  -b -- "$selectedIsoFile")
   if [ "$disableMimeCheck" == 'true' ]; then
     echowarn "Mime check has been disabled with \`--no-mime-check'. Skipping."
     return 0
@@ -218,7 +235,7 @@ assertISOMimeType() {
     echogood "The selected ISO file has the right \`application/x-iso9660-image' mime type."
   fi
   # Label is set to uppercase because FAT32 labels should be
-  isoLabel=$(blkid -o value -s LABEL -- "$selectedIsoFile" | awk '{print toupper($0)}')
+  partitionLabel=${partitionLabel:-$(blkid -o value -s LABEL -- "$selectedIsoFile" | awk '{print toupper($0)}')}
 }
 
 checkpkg() {
@@ -243,7 +260,18 @@ checkpkg() {
 fi
 }
 
-joinBy() { local IFS="$1"; shift; echo "$*"; }
+joinBy() {
+  local IFS="$1";
+  shift;
+  echo "$*";
+}
+
+containsElement () {
+  local e match="$1"
+  shift
+  for e; do [[ "$e" == "$match" ]] && return 0; done
+  return 1
+}
 
 initDevicesList() {
   typeset -a devices
@@ -294,6 +322,16 @@ parseOptions() {
         shift
         shift
         ;;
+        -t|--type)
+        partitionType="$2"
+        shift
+        shift
+        ;;
+        -L|--label)
+        partitionLabel="$2"
+        shift
+        shift
+        ;;
         -J|--no-eject)
         ejectDevice=false
         shift
@@ -322,9 +360,13 @@ parseOptions() {
         strictMimeCheck=true
         shift
         ;;
+        -f|--format)
+        mode='format'
+        shift
+        ;;
         --dd)
-        useDD=true
-        shouldMakeFAT32Partition=false
+        mode='dd'
+        shouldMakePartition=false
         shift
         ;;
         --no-usb-check)
@@ -415,12 +457,6 @@ deviceIsDisk() {
 
 selectDevice() {
   typeset _selectedDevice
-  containsElement () {
-    local e match="$1"
-    shift
-    for e; do [[ "$e" == "$match" ]] && return 0; done
-    return 1
-  }
   chooseDevice() {
     echo -e "Select the device corresponding to the USB device you want to make bootable among: $(joinBy ',' "${devicesList[@]}")\\nType exit to quit."
     read -r -p "Select device id>" _selectedDevice
@@ -506,23 +542,37 @@ shouldWipeUSBKey() {
   fi
 }
 
+# $1: not-bootable? true (default false)
 partitionUSB() {
+  typeset -A mkfsLabelOpts=([vfat]="-n" [exfat]="-n" [ntfs]="-n" [ext4]="-L" [ext3]="-L")
+  typeset notBootable=${false:-1}
+  typeset partitionOptions
+  if [ "$notBootable" == true ]; then
+    partitionOptions="$selectedPartition : start=2048, type=${fdiskTypeCodes[$partitionType]}"
+  else
+    partitionOptions="$selectedPartition : start=2048, type=${fdiskTypeCodes[$partitionType]}, bootable"
+  fi
   if shouldWipeUSBKey; then
+    # unmount any partition on selected device
+    mapfile -t devicePartitions < <(grep -oP "^\\K$selectedDevice\\S*" /proc/mounts)
+    for partition in "${devicePartitions[@]}"; do
+        if ! umount "$partition" > /dev/null; then
+          failAndExit "Failed to unmount $partition. It's likely that partition is busy."
+        fi
+    done
     echo "Erasing contents of $selectedDevice..."
-    # unmount any partition
-    umount "$selectedDevice" &> /dev/null || true;
-    umount "$selectedDevice"? &> /dev/null || true;
     # clean signature from selected device
     wipefs --all --force "$selectedDevice" &> /dev/null
     # erase drive
     dd if=/dev/zero of="$selectedDevice" bs=512 count=1 conv=notrunc status=none || failAndExit "Failed to erase USB device.\\nIt's likely that the device has been ejected and needs to be plugged-in again manually."
     sync
-    if [ "$shouldMakeFAT32Partition" == 'true' ]; then
+    if [ "$shouldMakePartition" == 'true' ]; then
       # Create partition table
-      echo "$selectedPartition : start=2048, type=b, bootable" | sfdisk "$selectedDevice" > /dev/null  || failAndExit "Failed to write USB device partition table."
+      echo "$partitionOptions" | sfdisk "$selectedDevice" > /dev/null  || failAndExit "Failed to write USB device partition table."
+      sync
       # format
-      echo "Creating FAT32 partition on \`$selectedPartition'..."
-      mkfs -t vfat -n "$isoLabel" "$selectedPartition" > /dev/null || failAndExit "Failed to create FAT32 partition on USB device.\\nMake sure you have mkfs.vfat installed on your system. Insall with \`$pkgmgr mkfs.vfat'"
+      echo "Creating $partitionType partition on \`$selectedPartition'..."
+      mkfs -t "$partitionType" "${mkfsLabelOpts[$partitionType]}" "$partitionLabel" "$selectedPartition" > /dev/null || failAndExit "Failed to create $partitionType partition on USB device.\\nMake sure you have mkfs.$partitionType installed on your system."
     fi
   else
     failAndExit "Discarding operation."
@@ -530,7 +580,7 @@ partitionUSB() {
 }
 
 mountUSB() {
-  typeset type=vfat
+  typeset type="$partitionType"
   usbMountPoint=$(createTempFolder usb) || exit 1
   echogood "Created USB device mount point at \`$usbMountPoint'"
   if ! mount -t "$type" "$selectedPartition" "$usbMountPoint" > /dev/null; then
@@ -629,36 +679,45 @@ installSyslinux() {
   fi
 }
 
+runSecurityAssessments() {
+  assertISOIsOK
+  selectDevice
+  assertDeviceIsOK
+  assertDeviceIsUSB
+}
+
 execWithRsync() {
+  runSecurityAssessments
   mountIsoFile
-  partitionUSB
+  partitionUSB false
   mountUSB
   copyWithRsync
   installSyslinux "$selectedPartition"
 }
 
 execWithDD() {
-  partitionUSB
+  runSecurityAssessments
+  partitionUSB false
   copyWithDD
 }
 
+execFormat() {
+  partitionLabel=${partitionLabel:-"BOOTISO"}
+  selectDevice
+  assertDeviceIsOK
+  assertDeviceIsUSB
+  partitionUSB true
+}
+
 checkOptions() {
-  if [ -z "$selectedIsoFile" ]; then
-    echoerr "Missing argument \`iso-file'."
-    display_help
-    exit 2
-  fi
-  if [ -d "$selectedIsoFile" ]; then
-    failAndExit "Provided file \`$selectedIsoFile' is a directory."
-  fi
-  if [ ! -f "$selectedIsoFile" ]; then
-    failAndExit "Provided iso file \`$selectedIsoFile' does not exists."
-  fi
-  if [ "$useDD" == 'true' ] && [ "$addSyslinuxBootloader" == 'true' ]; then
+  if [ "$mode" == 'dd' ] && [ "$addSyslinuxBootloader" == 'true' ]; then
     failAndExit "In \`dd' mode, \`$scriptName' cannot install a bootloader with \`syslinux'."
   fi
   if [ "$autoselect" == 'true' ] && [ "$disableUSBCheck" == 'true' ]; then
     failAndExit "You cannot set autoselect \`-a' option while disabling USB check with \`--no-usb-check'."
+  fi
+  if ! containsElement "$partitionType" "${!fdiskTypeCodes[@]}"; then
+    failAndExit "FS type \`$partitionType' not supported."
   fi
   # warnings (only with sudo)
   if ((EUID == 0)); then
@@ -669,27 +728,25 @@ checkOptions() {
 }
 
 main() {
-  typeset method
   initPckgManager "$@"
   parseOptions "$@"
   checkOptions
   checkSudo "$@"
   checkPackages
-  assertISOMimeType
-  selectDevice
-  assertDeviceIsOK
-  assertDeviceIsUSB
   startTime=$(date +%s)
-  if [ "$useDD" == 'true' ]; then
-    method='dd'
-    execWithDD
-  else
-    method='rsync'
-    execWithRsync
-  fi
+  echogood "Selected mode \`$mode'"
+  case "$mode" in
+    'dd') execWithDD ;;
+    'rsync') execWithRsync ;;
+    'format') execFormat;;
+  esac
   endTime=$(date +%s)
-  echogood "\`$scriptName' took $((endTime - startTime)) seconds to write ISO to USB device with \`$method' method."
-  operationSuccess=true
+  if [ ! "$mode" == 'format' ]; then
+    echogood "\`$scriptName' took $((endTime - startTime)) seconds to write ISO to USB device with \`$mode' method."
+    operationSuccess=true
+  else
+    echogood "\`$scriptName' took $((endTime - startTime)) seconds to format your USB device."
+  fi
 }
 
 cleanup() {
