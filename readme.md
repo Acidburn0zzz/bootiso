@@ -24,7 +24,7 @@ Or provide explicitly the USB device. Command fails and exit if the provided dev
 
     bootiso -d /dev/sde myfile.iso
 
-Add a [syslinux bootloader](https://en.wikipedia.org/wiki/SYSLINUX) for [non-hybrid ISOs](https://superuser.com/questions/683210/how-do-i-determine-if-an-iso-is-a-hybrid):
+Add a [syslinux bootloader](https://en.wikipedia.org/wiki/SYSLINUX) for [non-hybrid ISOs](https://superuser.com/questions/683210/how-do-i-determine-if-an-iso-is-a-hybrid) such as Windows':
 
     bootiso -bd /dev/sde myfile.iso
 
