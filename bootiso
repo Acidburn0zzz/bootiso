@@ -771,7 +771,7 @@ cleanup() {
       if [ "$ejectDevice" == 'true' ]; then
         if eject "$selectedDevice" &> /dev/null; then
           echogood "USB device succesfully ejected."
-          echogood "You can safely remove it !"
+          echogood "You can safely remove it!"
         fi
       else
         echowarn "USB device ejection skipped with \`-J' option."
